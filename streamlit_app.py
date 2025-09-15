@@ -12,7 +12,6 @@ import io
 import base64
 import threading
 import queue
-from streamlit_webrtc import webrtc_streamer, VideoProcessorBase, WebRtcMode
 
 # PDF generation libraries
 try:
@@ -964,40 +963,40 @@ def main():
             col1, col2 = st.columns(2)
 
             with col1:
-                st.header("📹 Camera Feed")
+                if st.button(
+                    "🔴 Start Scan", disabled=st.session_state.monitoring_active
+                ):
+                    if not st.session_state.face_detected:
+                        st.warning("Please ensure your face is visible in the camera!")
+                    else:
+                        st.session_state.monitoring_active = True
+                        st.session_state.calculation_count = 0
 
-                if camera_enabled:
+                        # Clear all data
+                        st.session_state.ppg_signal.clear()
+                        st.session_state.timestamps.clear()
+                        st.session_state.hr_values.clear()
+                        st.session_state.br_values.clear()
+                        st.session_state.hrv_values.clear()
+                        st.session_state.stress_values.clear()
+                        st.session_state.para_values.clear()
+                        st.session_state.wellness_values.clear()
+                        st.session_state.bp_sys_values.clear()
+                        st.session_state.bp_dia_values.clear()
 
-                    class VideoProcessor(VideoProcessorBase):
-                        def __init__(self):
-                            self.monitor = monitor
+                        # Initialize session data
+                        st.session_state.session_data = {
+                            "start_time": datetime.now().isoformat(),
+                            "end_time": None,
+                            "measurements": [],
+                            "raw_ppg_data": [],
+                            "timestamps_data": [],
+                        }
 
-                        def recv(self, frame):
-                            img = frame.to_ndarray(format="bgr24")
-                            processed = self.monitor.process_frame(img)
-                            return av.VideoFrame.from_ndarray(processed, format="bgr24")
-
-                    webrtc_streamer(
-                        key="face-vital-monitor",
-                        mode=WebRtcMode.SENDRECV,
-                        video_processor_factory=VideoProcessor,
-                        media_stream_constraints={"video": True, "audio": False},
-                    )
-
-                    # Status indicator
-                    status = (
-                        "🟢 Face Detected"
-                        if st.session_state.face_detected
-                        else "🔴 No Face Detected"
-                    )
-                    if st.session_state.monitoring_active:
-                        status += (
-                            f" - 📹 Recording ({len(st.session_state.ppg_signal)}/900)"
+                        st.success(
+                            "30-second health monitoring started! Please remain still and look at the camera."
                         )
-                    st.write(status)
-
-                else:
-                    st.info("Enable camera to start monitoring")
+                        st.rerun()
 
             with col2:
                 if st.button(
