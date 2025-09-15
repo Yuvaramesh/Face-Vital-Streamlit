@@ -456,7 +456,7 @@ class StreamlitFaceVitalMonitor:
                     )
 
                 # Start calculating after 10 seconds
-                elif len(st.session_state.ppg_signal) >= 300:
+                elif len(st.session_state.ppg_signal) >= 150:
                     self.calculate_all_metrics(face_landmarks.landmark)
         else:
             st.session_state.face_detected = False
