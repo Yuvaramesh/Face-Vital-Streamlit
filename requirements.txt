@@ -9,3 +9,4 @@ Pillow>=10.0.0
 reportlab>=4.0.0
 streamlit-webrtc
 opencv-python-headless>=4.8.0
+aiortc
