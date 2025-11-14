@@ -10,9 +10,14 @@ from collections import deque
 from datetime import datetime
 import io
 import base64
-import os
+import threading
+import queue
+from streamlit_webrtc import webrtc_streamer, VideoProcessorBase, WebRtcMode
+import av
+import logging
 
-IS_STREAMLIT_CLOUD = os.getenv("STREAMLIT_CLOUD", False)
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
 # PDF generation libraries
 try:
@@ -33,10 +38,69 @@ try:
     PDF_AVAILABLE = True
 except ImportError:
     PDF_AVAILABLE = False
+    st.error(
+        "ReportLab is required for PDF generation! Install with: pip install reportlab"
+    )
+
+
+def get_webrtc_config():
+    """Get enhanced WebRTC configuration with multiple STUN/TURN servers"""
+    return {
+        "iceServers": [
+            # Google STUN servers
+            {"urls": ["stun:stun.l.google.com:19302"]},
+            {"urls": ["stun:stun1.l.google.com:19302"]},
+            {"urls": ["stun:stun2.l.google.com:19302"]},
+            {"urls": ["stun:stun3.l.google.com:19302"]},
+            {"urls": ["stun:stun4.l.google.com:19302"]},
+            # Additional public STUN servers for better connectivity
+            {"urls": ["stun:stun.stunprotocol.org:3478"]},
+            {"urls": ["stun:stun.voiparound.com"]},
+            {"urls": ["stun:stun.voipbuster.com"]},
+            {"urls": ["stun:stun.voipstunt.com"]},
+            {"urls": ["stun:stun.voxgratia.org"]},
+            # OpenRelay STUN servers
+            {"urls": ["stun:openrelay.metered.ca:80"]},
+            # Twilio STUN servers (public)
+            {"urls": ["stun:global.stun.twilio.com:3478"]},
+            # Free TURN servers (you may want to replace with your own)
+            {
+                "urls": ["turn:openrelay.metered.ca:80"],
+                "username": "openrelayproject",
+                "credential": "openrelayproject",
+            },
+            {
+                "urls": ["turn:openrelay.metered.ca:443"],
+                "username": "openrelayproject",
+                "credential": "openrelayproject",
+            },
+            {
+                "urls": ["turn:openrelay.metered.ca:443?transport=tcp"],
+                "username": "openrelayproject",
+                "credential": "openrelayproject",
+            },
+        ],
+        "iceCandidatePoolSize": 10,
+        "bundlePolicy": "max-bundle",
+        "rtcpMuxPolicy": "require",
+    }
+
+
+def get_media_constraints():
+    """Get media constraints with fallback options for better compatibility"""
+    return {
+        "video": {
+            "width": {"min": 320, "ideal": 640, "max": 1280},
+            "height": {"min": 240, "ideal": 480, "max": 720},
+            "frameRate": {"min": 15, "ideal": 30, "max": 30},
+            "facingMode": "user",
+            "aspectRatio": 1.333,
+        },
+        "audio": False,
+    }
 
 
 class StreamlitFaceVitalMonitor:
-
     def __init__(self):
         # Initialize MediaPipe face detection
         self.mp_face_mesh = mp.solutions.face_mesh
@@ -55,7 +119,7 @@ class StreamlitFaceVitalMonitor:
         if "face_detected" not in st.session_state:
             st.session_state.face_detected = False
         if "ppg_signal" not in st.session_state:
-            st.session_state.ppg_signal = deque(maxlen=900)
+            st.session_state.ppg_signal = deque(maxlen=900)  # 30 seconds at 30fps
         if "timestamps" not in st.session_state:
             st.session_state.timestamps = deque(maxlen=900)
         if "calculation_count" not in st.session_state:
@@ -102,37 +166,78 @@ class StreamlitFaceVitalMonitor:
                 "timestamps_data": [],
             }
 
-        if "camera_initialized" not in st.session_state:
-            st.session_state.camera_initialized = False
-        if "camera_error" not in st.session_state:
-            st.session_state.camera_error = None
+        if "video_processor" not in st.session_state:
+            st.session_state.video_processor = None
+
+        if "webrtc_connection_state" not in st.session_state:
+            st.session_state.webrtc_connection_state = "disconnected"
+        if "connection_attempts" not in st.session_state:
+            st.session_state.connection_attempts = 0
 
     def extract_ppg_signal(self, frame, landmarks):
+        """Extract PPG signal from facial landmarks"""
         try:
-            h, w = frame.shape[:2]
+            h, w, _ = frame.shape
 
-            # Define ROI indices for forehead and cheek regions
-            forehead_indices = [10, 151, 9, 10, 151, 9, 10, 151]
-            left_cheek_indices = [116, 117, 118, 119, 120, 121]
-            right_cheek_indices = [345, 346, 347, 348, 349, 350]
+            # Define ROI points for forehead and cheeks
+            forehead_points = [10, 151, 9, 8]
+            left_cheek_points = [
+                116,
+                117,
+                118,
+                119,
+                120,
+                121,
+                126,
+                142,
+                36,
+                205,
+                206,
+                207,
+                213,
+                192,
+                147,
+                187,
+                207,
+                213,
+                192,
+                147,
+            ]
+            right_cheek_points = [
+                345,
+                346,
+                347,
+                348,
+                349,
+                350,
+                451,
+                452,
+                453,
+                464,
+                435,
+                410,
+                454,
+                323,
+                361,
+                340,
+                346,
+                347,
+                348,
+                349,
+            ]
 
             roi_values = []
 
-            for indices in [forehead_indices, left_cheek_indices, right_cheek_indices]:
-                region_points = []
-                for idx in indices:
-                    if idx < len(landmarks):
-                        x = int(landmarks[idx].x * w)
-                        y = int(landmarks[idx].y * h)
-                        region_points.append([x, y])
+            # Extract values from all ROI points
+            for points in [forehead_points, left_cheek_points, right_cheek_points]:
+                for point_idx in points:
+                    if point_idx < len(landmarks.landmark):
+                        x = int(landmarks.landmark[point_idx].x * w)
+                        y = int(landmarks.landmark[point_idx].y * h)
 
-                if len(region_points) > 2:
-                    mask = np.zeros(frame.shape[:2], dtype=np.uint8)
-                    cv2.fillPoly(mask, [np.array(region_points)], 255)
-
-                    green_channel = frame[:, :, 1]
-                    roi_mean = cv2.mean(green_channel, mask)[0]
-                    roi_values.append(roi_mean)
+                        if 0 <= x < w and 0 <= y < h:
+                            # Extract green channel value (most sensitive to blood volume changes)
+                            roi_values.append(frame[y, x, 1])
 
             if roi_values:
                 ppg_value = np.mean(roi_values)
@@ -141,78 +246,103 @@ class StreamlitFaceVitalMonitor:
                 return 0
 
         except Exception as e:
+            logger.error(f"Error extracting PPG signal: {e}")
             return 0
 
     def calculate_heart_rate(self, signal_data, timestamps, fps=30):
-        if len(signal_data) < fps * 8:
-            return 0
-
+        """Calculate heart rate from PPG signal"""
         try:
-            detrended = signal.detrend(signal_data)
+            if len(signal_data) < fps * 10:  # Need at least 10 seconds
+                return 0
+
+            # Convert to numpy array and apply filtering
+            signal_array = np.array(signal_data)
+
+            # Apply bandpass filter for heart rate (0.8-3.5 Hz = 48-210 BPM)
             nyquist = fps / 2
             low = 0.8 / nyquist
-            high = 4.0 / nyquist
+            high = 3.5 / nyquist
             b, a = signal.butter(4, [low, high], btype="band")
-            filtered = signal.filtfilt(b, a, detrended)
+            filtered_signal = signal.filtfilt(b, a, signal_array)
 
-            fft_data = fft(filtered)
-            freqs = np.fft.fftfreq(len(filtered), 1 / fps)
+            # Apply FFT
+            fft_result = np.abs(fft(filtered_signal))
+            freqs = np.fft.fftfreq(len(filtered_signal), 1 / fps)
 
-            valid_indices = (freqs >= 0.8) & (freqs <= 4.0)
-            valid_fft = np.abs(fft_data[valid_indices])
-            valid_freqs = freqs[valid_indices]
-
-            if len(valid_fft) > 0:
+            # Find peak in valid frequency range
+            valid_idx = (freqs >= 0.8) & (freqs <= 3.5)
+            if np.any(valid_idx):
+                valid_freqs = freqs[valid_idx]
+                valid_fft = fft_result[valid_idx]
                 peak_idx = np.argmax(valid_fft)
                 heart_rate_hz = valid_freqs[peak_idx]
                 heart_rate_bpm = heart_rate_hz * 60
                 return max(50, min(200, heart_rate_bpm))
 
         except Exception as e:
-            pass
+            logger.error(f"Error calculating heart rate: {e}")
 
         return 0
 
     def calculate_breathing_rate(self, signal_data, fps=30):
-        if len(signal_data) < fps * 12:
-            return 0
-
+        """Calculate breathing rate from PPG signal variations"""
         try:
+            if len(signal_data) < fps * 15:  # Need at least 15 seconds
+                return 0
+
+            signal_array = np.array(signal_data)
+
+            # Apply low-pass filter for breathing rate (0.1-0.6 Hz = 6-36 BPM)
             nyquist = fps / 2
-            low = 0.1 / nyquist
-            high = 0.5 / nyquist
-            b, a = signal.butter(2, [low, high], btype="band")
-            filtered = signal.filtfilt(b, a, signal_data)
+            high = 0.6 / nyquist
+            b, a = signal.butter(4, high, btype="low")
+            filtered_signal = signal.filtfilt(b, a, signal_array)
 
-            peaks, _ = signal.find_peaks(filtered, distance=fps * 2)
-            breathing_rate = len(peaks) * (60 / (len(signal_data) / fps))
-
+            # Calculate breathing rate using autocorrelation
+            breathing_rate = self._estimate_breathing_from_envelope(
+                filtered_signal, fps
+            )
             return max(8, min(35, breathing_rate))
 
         except Exception as e:
+            logger.error(f"Error calculating breathing rate: {e}")
             return 0
 
     def estimate_blood_pressure(self, heart_rate, hrv, stress_index):
+        """Estimate blood pressure using correlation with HR, HRV, and stress"""
         try:
             base_sys = 120
             base_dia = 80
 
+            # Adjust based on heart rate
             hr_factor = (heart_rate - 70) * 0.5
-            stress_factor = stress_index * 10
-            hrv_factor = (50 - hrv) * 0.2
 
-            sys_bp = base_sys + hr_factor + stress_factor + hrv_factor
-            dia_bp = base_dia + hr_factor * 0.6 + stress_factor * 0.6 + hrv_factor * 0.6
+            # Adjust based on HRV (lower HRV = higher BP)
+            hrv_factor = (50 - hrv) * 0.3
 
+            # Adjust based on stress
+            stress_factor = stress_index * 0.4
+
+            sys_bp = base_sys + hr_factor + hrv_factor + stress_factor
+            dia_bp = (
+                base_dia
+                + (hr_factor * 0.6)
+                + (hrv_factor * 0.5)
+                + (stress_factor * 0.3)
+            )
+
+            # Clamp to reasonable ranges
             sys_bp = max(90, min(180, sys_bp))
             dia_bp = max(60, min(120, dia_bp))
 
             return int(sys_bp), int(dia_bp)
 
         except Exception as e:
+            logger.error(f"Error estimating blood pressure: {e}")
             return 120, 80
 
     def calculate_hrv(self, signal_data, fps=30):
+        """Calculate Heart Rate Variability"""
         if len(signal_data) < fps * 15:
             return 0
 
@@ -230,9 +360,11 @@ class StreamlitFaceVitalMonitor:
             return min(100, max(10, rmssd))
 
         except Exception as e:
+            st.error(f"Error calculating HRV: {e}")
             return 0
 
     def calculate_stress_index(self, heart_rate, hrv, breathing_rate):
+        """Calculate stress index based on multiple parameters"""
         try:
             hr_stress = max(0, (heart_rate - 70) / 50)
             hrv_stress = max(0, (50 - hrv) / 50)
@@ -242,9 +374,11 @@ class StreamlitFaceVitalMonitor:
             return min(1.0, max(0.0, stress_index))
 
         except Exception as e:
+            st.error(f"Error calculating stress index: {e}")
             return 0
 
     def calculate_parasympathetic_activity(self, hrv, breathing_rate):
+        """Estimate parasympathetic nervous system activity"""
         try:
             hrv_factor = min(1.0, hrv / 50)
             breathing_factor = max(0, (20 - breathing_rate) / 10)
@@ -253,9 +387,11 @@ class StreamlitFaceVitalMonitor:
             return min(100, max(0, parasympathetic))
 
         except Exception as e:
+            st.error(f"Error calculating parasympathetic activity: {e}")
             return 50
 
     def calculate_wellness_score(self):
+        """Calculate overall wellness score"""
         try:
             hr = st.session_state.results["heart_rate"]
             hrv = st.session_state.results["hrv"]
@@ -271,9 +407,11 @@ class StreamlitFaceVitalMonitor:
             return max(0, min(100, wellness))
 
         except Exception as e:
+            st.error(f"Error calculating wellness score: {e}")
             return 50
 
     def calculate_all_metrics(self, landmarks):
+        """Calculate all health metrics"""
         if len(st.session_state.ppg_signal) < 300:
             return
 
@@ -329,6 +467,7 @@ class StreamlitFaceVitalMonitor:
         st.session_state.session_data["measurements"].append(measurement)
 
     def get_status_color(self, metric, value):
+        """Get color for metric based on value"""
         if metric == "heart_rate":
             if 60 <= value <= 100:
                 return "green"
@@ -382,6 +521,7 @@ class StreamlitFaceVitalMonitor:
         return "black"
 
     def process_frame(self, frame):
+        """Process video frame for face detection and PPG extraction"""
         frame = cv2.flip(frame, 1)
         frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
 
@@ -437,6 +577,9 @@ class StreamlitFaceVitalMonitor:
                     st.session_state.session_data["end_time"] = (
                         datetime.now().isoformat()
                     )
+                    st.success(
+                        "30-second monitoring completed! You can now generate your PDF report."
+                    )
 
                 # Start calculating after 10 seconds
                 elif len(st.session_state.ppg_signal) >= 150:
@@ -447,6 +590,7 @@ class StreamlitFaceVitalMonitor:
         return frame
 
     def generate_pdf_report(self):
+        """Generate comprehensive PDF report"""
         if not st.session_state.session_data["measurements"]:
             st.warning(
                 "No monitoring data available! Please complete a monitoring session first."
@@ -646,6 +790,7 @@ class StreamlitFaceVitalMonitor:
                         story.append(Spacer(1, 15))
                         plt.close(fig)
                     except Exception as e:
+                        st.error(f"Error creating plot for {name}: {e}")
                         continue
 
             # Add health interpretation and recommendations
@@ -672,9 +817,11 @@ class StreamlitFaceVitalMonitor:
             return buffer.getvalue()
 
         except Exception as e:
+            st.error(f"Error generating PDF: {e}")
             return None
 
     def get_status_text(self, metric):
+        """Get status text for a metric"""
         if metric == "heart_rate":
             hr = st.session_state.results["heart_rate"]
             if 60 <= hr <= 100:
@@ -735,6 +882,7 @@ class StreamlitFaceVitalMonitor:
         return "Unknown"
 
     def get_health_interpretation(self):
+        """Get health interpretation based on measurements"""
         interpretations = []
 
         hr = st.session_state.results["heart_rate"]
@@ -809,6 +957,7 @@ class StreamlitFaceVitalMonitor:
         return "\n".join(interpretations)
 
     def get_recommendations(self):
+        """Get health recommendations based on measurements"""
         recommendations = []
 
         hr = st.session_state.results["heart_rate"]
@@ -864,33 +1013,108 @@ class StreamlitFaceVitalMonitor:
         return "\n".join(recommendations)
 
 
-def initialize_camera():
-    """Safely initialize camera with error handling"""
-    try:
-        if not st.session_state.camera_initialized:
-            cap = cv2.VideoCapture(0)
+class VideoProcessor(VideoProcessorBase):
+    def __init__(self):
+        self.monitor = StreamlitFaceVitalMonitor()
+        self.frame_count = 0
+        self.last_calculation_time = time.time()
 
-            # Test if camera is available
-            ret, _ = cap.read()
+    def recv(self, frame):
+        try:
+            if st.session_state.webrtc_connection_state != "connected":
+                st.session_state.webrtc_connection_state = "connected"
+                st.session_state.connection_attempts = 0
+                logger.info("WebRTC connection established successfully")
 
-            if ret:
-                cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
-                cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
-                cap.set(cv2.CAP_PROP_FPS, 30)
-                st.session_state.cap = cap
-                st.session_state.camera_initialized = True
-                st.session_state.camera_error = None
-                return True
+            img = frame.to_ndarray(format="bgr24")
+
+            # Process frame for face detection and vital signs
+            rgb_img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+            results = self.monitor.face_mesh.process(rgb_img)
+
+            current_time = time.time()
+
+            if results.multi_face_landmarks:
+                st.session_state.face_detected = True
+
+                for face_landmarks in results.multi_face_landmarks:
+                    # Draw face mesh
+                    self.monitor.mp_drawing.draw_landmarks(
+                        img,
+                        face_landmarks,
+                        self.monitor.mp_face_mesh.FACEMESH_CONTOURS,
+                        landmark_drawing_spec=None,
+                        connection_drawing_spec=self.monitor.mp_drawing.DrawingSpec(
+                            color=(0, 255, 0), thickness=1, circle_radius=1
+                        ),
+                    )
+
+                    # Extract PPG signal
+                    if st.session_state.monitoring_active:
+                        ppg_value = self.monitor.extract_ppg_signal(img, face_landmarks)
+                        st.session_state.ppg_signal.append(ppg_value)
+                        st.session_state.timestamps.append(current_time)
+
+                        # Calculate vitals every 2 seconds
+                        if current_time - self.last_calculation_time >= 2.0:
+                            self._calculate_vitals()
+                            self.last_calculation_time = current_time
             else:
-                cap.release()
-                st.session_state.camera_error = "Camera not found or not accessible"
-                st.session_state.camera_initialized = False
-                return False
+                st.session_state.face_detected = False
 
-    except Exception as e:
-        st.session_state.camera_error = f"Error initializing camera: {str(e)}"
-        st.session_state.camera_initialized = False
-        return False
+            self.frame_count += 1
+            return av.VideoFrame.from_ndarray(img, format="bgr24")
+
+        except Exception as e:
+            logger.error(f"Error in video processing: {e}")
+            st.session_state.webrtc_connection_state = "error"
+            return frame
+
+    def _calculate_vitals(self):
+        """Calculate all vital signs"""
+        try:
+            if len(st.session_state.ppg_signal) > 300:  # At least 10 seconds of data
+                signal_data = list(st.session_state.ppg_signal)
+                timestamps = list(st.session_state.timestamps)
+
+                # Calculate heart rate
+                hr = self.monitor.calculate_heart_rate(signal_data, timestamps)
+                st.session_state.results["heart_rate"] = hr
+                st.session_state.hr_values.append(hr)
+
+                # Calculate breathing rate
+                br = self.monitor.calculate_breathing_rate(signal_data)
+                st.session_state.results["breathing_rate"] = br
+                st.session_state.br_values.append(br)
+
+                # Calculate HRV and other metrics
+                hrv = self.monitor.calculate_hrv(signal_data, timestamps)
+                st.session_state.results["hrv"] = hrv
+                st.session_state.hrv_values.append(hrv)
+
+                stress = self.monitor.calculate_stress_index(hrv, hr)
+                st.session_state.results["stress_index"] = stress
+                st.session_state.stress_values.append(stress)
+
+                para = self.monitor.calculate_parasympathetic_activity(hrv, hr)
+                st.session_state.results["parasympathetic"] = para
+                st.session_state.para_values.append(para)
+
+                wellness = self.monitor.calculate_wellness_score(hr, hrv, stress, br)
+                st.session_state.results["wellness_score"] = wellness
+                st.session_state.wellness_values.append(wellness)
+
+                # Estimate blood pressure
+                sys_bp, dia_bp = self.monitor.estimate_blood_pressure(hr, hrv, stress)
+                st.session_state.results["blood_pressure_sys"] = sys_bp
+                st.session_state.results["blood_pressure_dia"] = dia_bp
+                st.session_state.bp_sys_values.append(sys_bp)
+                st.session_state.bp_dia_values.append(dia_bp)
+
+                st.session_state.calculation_count += 1
+
+        except Exception as e:
+            logger.error(f"Error calculating vitals: {e}")
 
 
 def main():
@@ -901,7 +1125,6 @@ def main():
         initial_sidebar_state="expanded",
     )
 
-    # Custom CSS for better styling
     st.markdown(
         """
     <style>
@@ -918,298 +1141,202 @@ def main():
         padding: 1rem;
         border-radius: 10px;
         box-shadow: 0 2px 4px rgba(0,0,0,0.1);
-        text-align: center;
-        margin: 0.5rem 0;
+        border-left: 4px solid #667eea;
     }
-    .status-indicator {
-        width: 20px;
-        height: 20px;
-        border-radius: 50%;
-        display: inline-block;
-        margin-left: 10px;
+    .status-connected {
+        color: #28a745;
+        font-weight: bold;
     }
-    .scanning-border {
-        border: 3px solid #00ff00;
-        border-radius: 10px;
-        animation: pulse 2s infinite;
+    .status-connecting {
+        color: #ffc107;
+        font-weight: bold;
     }
-    @keyframes pulse {
-        0% { border-color: #00ff00; }
-        50% { border-color: #00aa00; }
-        100% { border-color: #00ff00; }
+    .status-error {
+        color: #dc3545;
+        font-weight: bold;
+    }
+    .connection-help {
+        background: #f8f9fa;
+        padding: 1rem;
+        border-radius: 8px;
+        border-left: 4px solid #17a2b8;
+        margin: 1rem 0;
     }
     </style>
     """,
         unsafe_allow_html=True,
     )
 
-    # Initialize the monitor
-    monitor = StreamlitFaceVitalMonitor()
-
-    # Header
     st.markdown(
-        """
-    <div class="main-header">
-        <h1>🫀 Face Vital Monitor - Comprehensive Health Analysis</h1>
-        <p>Advanced PPG-based health monitoring with real-time analysis and PDF reporting</p>
-    </div>
-    """,
+        '<div class="main-header"><h1>🫀 Face Vital Monitor</h1><p>Advanced Contactless Health Monitoring System</p></div>',
         unsafe_allow_html=True,
     )
 
-    if IS_STREAMLIT_CLOUD:
-        st.warning(
-            """
-            ⚠️ **Cloud Deployment Mode Detected**
-            
-            This app requires a **local camera** to function. Camera access is not available on Streamlit Cloud.
-            
-            **To use this app:**
-            1. Download the code to your local machine
-            2. Install dependencies: `pip install -r requirements.txt`
-            3. Run locally: `streamlit run streamlit_app.py`
-            4. Your camera will be accessible on localhost
-            
-            **Cloud Version:** This deployment is read-only and shows demo data only.
-            """
-        )
+    monitor = StreamlitFaceVitalMonitor()
 
     # Sidebar controls
     with st.sidebar:
         st.header("📹 Camera Controls")
 
-        if not IS_STREAMLIT_CLOUD:
-            camera_enabled = st.checkbox("Enable Camera", value=True)
-
-            if camera_enabled:
-                # Initialize camera
-                if not st.session_state.camera_initialized:
-                    if not initialize_camera():
-                        st.error(
-                            f"Camera Error: {st.session_state.camera_error}\n\nPlease check that your camera is connected and not in use by another application."
-                        )
-                        camera_enabled = False
-
-                if camera_enabled and st.session_state.camera_initialized:
-                    # Start/Stop monitoring buttons
-                    col1, col2 = st.columns(2)
-
-                    with col1:
-                        if st.button(
-                            "🔴 Start Scan",
-                            disabled=st.session_state.monitoring_active,
-                        ):
-                            if not st.session_state.face_detected:
-                                st.warning(
-                                    "Please ensure your face is visible in the camera!"
-                                )
-                            else:
-                                st.session_state.monitoring_active = True
-                                st.session_state.calculation_count = 0
-
-                                # Clear all data
-                                st.session_state.ppg_signal.clear()
-                                st.session_state.timestamps.clear()
-                                st.session_state.hr_values.clear()
-                                st.session_state.br_values.clear()
-                                st.session_state.hrv_values.clear()
-                                st.session_state.stress_values.clear()
-                                st.session_state.para_values.clear()
-                                st.session_state.wellness_values.clear()
-                                st.session_state.bp_sys_values.clear()
-                                st.session_state.bp_dia_values.clear()
-
-                                # Initialize session data
-                                st.session_state.session_data = {
-                                    "start_time": datetime.now().isoformat(),
-                                    "end_time": None,
-                                    "measurements": [],
-                                    "raw_ppg_data": [],
-                                    "timestamps_data": [],
-                                }
-
-                                st.success(
-                                    "30-second health monitoring started! Please remain still."
-                                )
-                                st.rerun()
-
-                    with col2:
-                        if st.button(
-                            "⏹️ Stop Scan",
-                            disabled=not st.session_state.monitoring_active,
-                        ):
-                            st.session_state.monitoring_active = False
-                            st.session_state.session_data["end_time"] = (
-                                datetime.now().isoformat()
-                            )
-                            st.success("Monitoring stopped!")
-                            st.rerun()
-
-                    # Progress indicator
-                    if st.session_state.monitoring_active:
-                        progress = min(
-                            100, (len(st.session_state.ppg_signal) / 900) * 100
-                        )
-                        st.progress(progress / 100)
-                        remaining_time = max(
-                            0, 30 - len(st.session_state.ppg_signal) / 30
-                        )
-                        st.write(f"⏱️ {remaining_time:.1f}s remaining")
-                    else:
-                        if len(st.session_state.ppg_signal) > 0:
-                            st.write("✅ Monitoring completed")
-                        else:
-                            st.write("⏳ Ready to start monitoring")
+        connection_state = st.session_state.get(
+            "webrtc_connection_state", "disconnected"
+        )
+        if connection_state == "connected":
+            st.markdown(
+                '<p class="status-connected">🟢 Camera Connected</p>',
+                unsafe_allow_html=True,
+            )
+        elif connection_state == "connecting":
+            st.markdown(
+                '<p class="status-connecting">🟡 Connecting...</p>',
+                unsafe_allow_html=True,
+            )
+        elif connection_state == "error":
+            st.markdown(
+                '<p class="status-error">🔴 Connection Error</p>',
+                unsafe_allow_html=True,
+            )
         else:
-            st.info(
-                "Camera disabled in cloud mode. Run locally for full functionality."
+            st.markdown(
+                '<p class="status-error">🔴 Camera Disconnected</p>',
+                unsafe_allow_html=True,
             )
 
-        # PDF Report Generation
-        st.header("📄 Report")
-        if st.button(
-            "Generate PDF Report",
-            disabled=not st.session_state.session_data["measurements"],
-        ):
-            with st.spinner("Generating comprehensive PDF report..."):
-                pdf_data = monitor.generate_pdf_report()
-                if pdf_data:
-                    st.download_button(
-                        label="📥 Download PDF Report",
-                        data=pdf_data,
-                        file_name=f"Health_Report_{datetime.now().strftime('%Y%m%d_%H%M%S')}.pdf",
-                        mime="application/pdf",
-                    )
+        camera_enabled = st.checkbox("Enable Camera", value=True)
 
-        # Instructions
-        st.header("📋 Instructions")
-        st.markdown(
-            """
-        1. **Position yourself** in front of the camera
-        2. **Ensure good lighting** on your face
-        3. **Look directly** at the camera
-        4. **Click "Start Scan"** and remain still for 30 seconds
-        5. **Generate PDF report** when complete
-        """
-        )
+        if (
+            connection_state in ["error", "disconnected"]
+            or st.session_state.get("connection_attempts", 0) > 0
+        ):
+            with st.expander("🔧 Connection Troubleshooting", expanded=True):
+                st.markdown(
+                    """
+                <div class="connection-help">
+                <h4>If camera connection fails:</h4>
+                <ol>
+                <li><strong>Check browser permissions:</strong> Allow camera access when prompted</li>
+                <li><strong>Try different browser:</strong> Chrome/Edge work best for WebRTC</li>
+                <li><strong>Check network:</strong> Corporate firewalls may block WebRTC</li>
+                <li><strong>Refresh page:</strong> Sometimes helps reset the connection</li>
+                <li><strong>Close other apps:</strong> That might be using your camera</li>
+                </ol>
+                <p><strong>Technical:</strong> Using enhanced STUN/TURN servers for better connectivity</p>
+                </div>
+                """,
+                    unsafe_allow_html=True,
+                )
+
+        st.divider()
+
+        col1, col2 = st.columns(2)
+        with col1:
+            if st.button("🔴 Start Scan", disabled=st.session_state.monitoring_active):
+                st.session_state.monitoring_active = True
+                st.session_state.session_data["start_time"] = datetime.now()
+                st.rerun()
+
+        with col2:
+            if st.button(
+                "⏹️ Stop Scan", disabled=not st.session_state.monitoring_active
+            ):
+                st.session_state.monitoring_active = False
+                st.session_state.session_data["end_time"] = datetime.now()
+                st.rerun()
+
+        if st.session_state.monitoring_active:
+            st.success("⏱️ Ready to start monitoring")
+        else:
+            st.info("📱 Click 'Start Scan' to begin")
 
     # Main content area
-    col1, col2 = st.columns([1, 1])
+    col1, col2 = st.columns([2, 1])
 
     with col1:
-        st.header("📹 Camera Feed")
+        st.subheader("📷 Camera Feed")
 
-        if not IS_STREAMLIT_CLOUD:
-            if st.session_state.camera_initialized and "cap" in st.session_state:
-                camera_placeholder = st.empty()
+        if camera_enabled:
+            if "video_processor" not in st.session_state:
+                st.session_state.video_processor = VideoProcessor
 
-                # Process frame
-                try:
-                    ret, frame = st.session_state.cap.read()
-                    if ret:
-                        processed_frame = monitor.process_frame(frame)
+            try:
+                st.session_state.webrtc_connection_state = "connecting"
+                st.session_state.connection_attempts += 1
 
-                        # Convert frame for display
-                        frame_rgb = cv2.cvtColor(processed_frame, cv2.COLOR_BGR2RGB)
+                webrtc_ctx = webrtc_streamer(
+                    key="face-vital-monitor",
+                    mode=WebRtcMode.SENDRECV,
+                    video_processor_factory=st.session_state.video_processor,
+                    media_stream_constraints=get_media_constraints(),
+                    rtc_configuration=get_webrtc_config(),
+                    async_processing=True,
+                    video_html_attrs={
+                        "style": {
+                            "width": "100%",
+                            "margin": "0 auto",
+                            "border-radius": "10px",
+                        },
+                        "controls": False,
+                        "autoplay": True,
+                        "muted": True,
+                    },
+                )
 
-                        # Add scanning border if monitoring
-                        if st.session_state.monitoring_active:
-                            camera_placeholder.markdown(
-                                f'<div class="scanning-border">',
-                                unsafe_allow_html=True,
-                            )
+                if webrtc_ctx.state.playing:
+                    st.session_state.webrtc_connection_state = "connected"
+                elif webrtc_ctx.state.signalling:
+                    st.session_state.webrtc_connection_state = "connecting"
+                else:
+                    st.session_state.webrtc_connection_state = "disconnected"
 
-                        camera_placeholder.image(
-                            frame_rgb, channels="RGB", use_container_width=True
-                        )
+            except Exception as e:
+                logger.error(f"WebRTC connection error: {e}")
+                st.session_state.webrtc_connection_state = "error"
+                st.error(f"Camera connection failed: {str(e)}")
+                st.info("Please check the troubleshooting guide in the sidebar.")
 
-                        # Status indicator
-                        status = (
-                            "🟢 Face Detected"
-                            if st.session_state.face_detected
-                            else "🔴 No Face Detected"
-                        )
-                        if st.session_state.monitoring_active:
-                            status += f" - 📹 Recording ({len(st.session_state.ppg_signal)}/900)"
-                        st.write(status)
-                    else:
-                        st.error("Failed to read frame from camera.")
-                except Exception as e:
-                    st.error(f"Camera error: {str(e)}")
-            elif st.session_state.camera_error:
-                st.error(f"Camera Error: {st.session_state.camera_error}")
-            else:
-                st.info("Enable camera to start monitoring")
+            # Status indicator
+            status = (
+                "🟢 Face Detected"
+                if st.session_state.face_detected
+                else "🔴 No Face Detected"
+            )
+            st.markdown(f"**Status:** {status}")
+
+            if st.session_state.get("connection_attempts", 0) > 3:
+                st.warning(
+                    "⚠️ Multiple connection attempts detected. Try refreshing the page or check your network connection."
+                )
+
         else:
-            st.info("Camera not available in cloud mode. Download and run locally.")
+            st.info("📷 Enable camera to start monitoring")
 
     with col2:
-        st.header("📊 Health Metrics")
+        st.subheader("📊 Health Metrics")
 
-        # Display current metrics in a grid
-        metrics_data = [
-            ("Heart Rate", st.session_state.results["heart_rate"], "bpm", "heart_rate"),
-            (
-                "Breathing Rate",
-                st.session_state.results["breathing_rate"],
-                "rpm",
-                "breathing_rate",
-            ),
-            (
-                "Blood Pressure",
-                f"{st.session_state.results['blood_pressure_sys']}/{st.session_state.results['blood_pressure_dia']}",
-                "mmHg",
-                "blood_pressure",
-            ),
-            ("HRV", st.session_state.results["hrv"], "ms", "hrv"),
-            (
-                "Stress Index",
-                st.session_state.results["stress_index"],
-                "",
-                "stress_index",
-            ),
-            (
-                "Parasympathetic",
-                st.session_state.results["parasympathetic"],
-                "%",
-                "parasympathetic",
-            ),
-            (
-                "Wellness Score",
-                st.session_state.results["wellness_score"],
-                "/100",
-                "wellness_score",
-            ),
-        ]
+        # Display current results
+        results = st.session_state.results
 
-        # Create 2x4 grid for metrics
-        for i in range(0, len(metrics_data), 2):
-            cols = st.columns(2)
-            for j, col in enumerate(cols):
-                if i + j < len(metrics_data):
-                    name, value, unit, metric_key = metrics_data[i + j]
+        # Heart Rate
+        st.metric(
+            label="💓 Heart Rate", value=f"{results['heart_rate']:.0f} bpm", delta=None
+        )
 
-                    if metric_key == "blood_pressure":
-                        color = monitor.get_status_color(
-                            metric_key,
-                            (
-                                st.session_state.results["blood_pressure_sys"],
-                                st.session_state.results["blood_pressure_dia"],
-                            ),
-                        )
-                    else:
-                        color = monitor.get_status_color(metric_key, value)
+        # Breathing Rate
+        st.metric(
+            label="🫁 Breathing Rate",
+            value=f"{results['breathing_rate']:.0f} rpm",
+            delta=None,
+        )
 
-                    with col:
-                        st.markdown(
-                            f"""
-                        <div class="metric-card">
-                            <h4>{name}</h4>
-                            <h2 style="color: {color}; margin: 0;">{value} {unit}</h2>
-                        </div>
-                        """,
-                            unsafe_allow_html=True,
-                        )
+        # Blood Pressure
+        st.metric(
+            label="🩸 Blood Pressure",
+            value=f"{results['blood_pressure_sys']:.0f}/{results['blood_pressure_dia']:.0f} mmHg",
+            delta=None,
+        )
+
+        # HRV
+        st.metric(label="📈 HRV", value=f"{results['hrv']:.0f} ms", delta=None)
 
     # Data Visualization Section
     if len(st.session_state.hr_values) > 1:
@@ -1329,12 +1456,10 @@ def main():
                 df = pd.DataFrame(measurements_df)
                 st.dataframe(df, use_container_width=True)
 
-    if not IS_STREAMLIT_CLOUD:
-        if st.session_state.monitoring_active or (
-            st.session_state.camera_initialized and "cap" in st.session_state
-        ):
-            time.sleep(0.1)
-            st.rerun()
+    # Auto-refresh for real-time updates when monitoring is active
+    if st.session_state.monitoring_active:
+        time.sleep(0.1)
+        st.rerun()
 
 
 if __name__ == "__main__":
