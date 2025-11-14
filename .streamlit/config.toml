@@ -6,10 +6,11 @@ textColor = "#262730"
 font = "sans serif"
 
 [client]
-showErrorDetails = true
+showErrorDetails = false
 
 [logger]
-level = "error"
+level = "warning"
 
 [server]
-maxUploadSize = 200
+headless = true
+runOnSave = false
