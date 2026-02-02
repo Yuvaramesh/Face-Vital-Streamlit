@@ -6,7 +6,7 @@ services:
     plan: free
     branch: main
     buildCommand: pip install --upgrade pip && pip install -r requirements.txt
-    startCommand: streamlit run streamlit_app.py --server.port $PORT --server.address 0.0.0.0 --server.headless true
+    startCommand: streamlit run streamlit_app.py --server.port $PORT --server.address 0.0.0.0 --server.headless true --server.enableCORS false --server.enableXsrfProtection false
     envVars:
       - key: PYTHON_VERSION
-        value: 3.10.0
+        value: 3.11.9
