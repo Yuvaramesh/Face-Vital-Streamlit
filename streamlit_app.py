@@ -39,9 +39,12 @@ except ImportError:
 
 class StreamlitFaceVitalMonitor:
     def __init__(self):
-        # Initialize MediaPipe face detection
+        # Initialize MediaPipe face detection with updated API
         self.mp_face_mesh = mp.solutions.face_mesh
         self.mp_drawing = mp.solutions.drawing_utils
+        self.mp_drawing_styles = mp.solutions.drawing_styles
+
+        # Updated FaceMesh initialization for MediaPipe 0.10.30+
         self.face_mesh = self.mp_face_mesh.FaceMesh(
             static_image_mode=False,
             max_num_faces=1,
@@ -405,33 +408,27 @@ class StreamlitFaceVitalMonitor:
             st.session_state.face_detected = True
             face_landmarks = results.multi_face_landmarks[0]
 
-            # Draw styled mesh
+            # Updated drawing for MediaPipe 0.10.30+
             self.mp_drawing.draw_landmarks(
-                frame,
-                face_landmarks,
-                self.mp_face_mesh.FACEMESH_TESSELATION,
+                image=frame,
+                landmark_list=face_landmarks,
+                connections=self.mp_face_mesh.FACEMESH_TESSELATION,
                 landmark_drawing_spec=None,
-                connection_drawing_spec=self.mp_drawing.DrawingSpec(
-                    color=(0, 255, 255), thickness=1, circle_radius=1
-                ),
+                connection_drawing_spec=self.mp_drawing_styles.get_default_face_mesh_tesselation_style(),
             )
             self.mp_drawing.draw_landmarks(
-                frame,
-                face_landmarks,
-                self.mp_face_mesh.FACEMESH_CONTOURS,
+                image=frame,
+                landmark_list=face_landmarks,
+                connections=self.mp_face_mesh.FACEMESH_CONTOURS,
                 landmark_drawing_spec=None,
-                connection_drawing_spec=self.mp_drawing.DrawingSpec(
-                    color=(255, 255, 255), thickness=2, circle_radius=1
-                ),
+                connection_drawing_spec=self.mp_drawing_styles.get_default_face_mesh_contours_style(),
             )
             self.mp_drawing.draw_landmarks(
-                frame,
-                face_landmarks,
-                self.mp_face_mesh.FACEMESH_IRISES,
+                image=frame,
+                landmark_list=face_landmarks,
+                connections=self.mp_face_mesh.FACEMESH_IRISES,
                 landmark_drawing_spec=None,
-                connection_drawing_spec=self.mp_drawing.DrawingSpec(
-                    color=(0, 200, 255), thickness=2, circle_radius=1
-                ),
+                connection_drawing_spec=self.mp_drawing_styles.get_default_face_mesh_iris_connections_style(),
             )
 
             # PPG signal extraction during monitoring
@@ -1046,6 +1043,9 @@ def main():
         3. **Look directly** at the camera
         4. **Click "Start Scan"** and remain still for 30 seconds
         5. **Generate PDF report** when complete
+        
+        **Note:** Camera access may not work on hosted platforms. 
+        For full functionality, run locally or use Streamlit Cloud.
         """
         )
 
@@ -1061,42 +1061,55 @@ def main():
 
             # Initialize camera
             if "cap" not in st.session_state:
-                st.session_state.cap = cv2.VideoCapture(0)
-                st.session_state.cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
-                st.session_state.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
-                st.session_state.cap.set(cv2.CAP_PROP_FPS, 30)
+                try:
+                    st.session_state.cap = cv2.VideoCapture(0)
+                    st.session_state.cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
+                    st.session_state.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
+                    st.session_state.cap.set(cv2.CAP_PROP_FPS, 30)
+                except Exception as e:
+                    st.error(f"Camera initialization failed: {e}")
+                    st.info(
+                        "Camera access is not available on this platform. Please run locally for camera features."
+                    )
+                    st.session_state.cap = None
 
             # Process frame
-            ret, frame = st.session_state.cap.read()
-            if ret:
-                processed_frame = monitor.process_frame(frame)
+            if st.session_state.cap is not None:
+                ret, frame = st.session_state.cap.read()
+                if ret:
+                    processed_frame = monitor.process_frame(frame)
 
-                # Convert frame for display
-                frame_rgb = cv2.cvtColor(processed_frame, cv2.COLOR_BGR2RGB)
+                    # Convert frame for display
+                    frame_rgb = cv2.cvtColor(processed_frame, cv2.COLOR_BGR2RGB)
 
-                # Add scanning border if monitoring
-                if st.session_state.monitoring_active:
-                    camera_placeholder.markdown(
-                        f'<div class="scanning-border">', unsafe_allow_html=True
+                    # Add scanning border if monitoring
+                    if st.session_state.monitoring_active:
+                        camera_placeholder.markdown(
+                            f'<div class="scanning-border">', unsafe_allow_html=True
+                        )
+
+                    camera_placeholder.image(
+                        frame_rgb, channels="RGB", use_container_width=True
                     )
 
-                camera_placeholder.image(
-                    frame_rgb, channels="RGB", use_container_width=True
-                )
-
-                # Status indicator
-                status = (
-                    "🟢 Face Detected"
-                    if st.session_state.face_detected
-                    else "🔴 No Face Detected"
-                )
-                if st.session_state.monitoring_active:
-                    status += (
-                        f" - 📹 Recording ({len(st.session_state.ppg_signal)}/900)"
+                    # Status indicator
+                    status = (
+                        "🟢 Face Detected"
+                        if st.session_state.face_detected
+                        else "🔴 No Face Detected"
                     )
-                st.write(status)
+                    if st.session_state.monitoring_active:
+                        status += (
+                            f" - 📹 Recording ({len(st.session_state.ppg_signal)}/900)"
+                        )
+                    st.write(status)
+                else:
+                    st.error("Camera not accessible. Please check camera permissions.")
             else:
-                st.error("Camera not accessible. Please check camera permissions.")
+                st.warning("⚠️ Camera not available on this platform")
+                st.info(
+                    "This app requires camera access which is not available on Render. Please deploy to Streamlit Cloud or run locally."
+                )
         else:
             st.info("Enable camera to start monitoring")
 
